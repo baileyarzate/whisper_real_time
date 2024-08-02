@@ -4,32 +4,34 @@ import argparse
 import os
 import numpy as np
 import speech_recognition as sr
-import whisper
+from faster_whisper import WhisperModel
 import torch
-
 from datetime import datetime, timedelta
 from queue import Queue
 from time import sleep
 from sys import platform
-
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", default="medium", help="Model to use",
-                        choices=["tiny", "base", "small", "medium", "large"])
-    parser.add_argument("--non_english", action='store_true',
-                        help="Don't use the english model.")
+    parser.add_argument("--model", default="distil-large-v3", help="Model to use",
+                        choices=["tiny", "tiny.en", "base", "base.en", "small", 
+                                 "small.en", "distil-small.en", "medium", "medium.en", 
+                                 "distil-medium.en", "large-v3", "distil-large-v3"])
     parser.add_argument("--energy_threshold", default=1000,
                         help="Energy level for mic to detect.", type=int)
-    parser.add_argument("--record_timeout", default=2,
+    parser.add_argument("--record_timeout", default=60,
                         help="How real time the recording is in seconds.", type=float)
-    parser.add_argument("--phrase_timeout", default=3,
+    parser.add_argument("--phrase_timeout", default=0.5,
                         help="How much empty space between recordings before we "
                              "consider it a new line in the transcription.", type=float)
+    parser.add_argument("--device", default = "cuda" if torch.cuda.is_available() else "cpu",
+                        help="Compute device used", type=str)
+    
     if 'linux' in platform:
         parser.add_argument("--default_microphone", default='pulse',
                             help="Default microphone name for SpeechRecognition. "
-                                 "Run this with 'list' to view available Microphones.", type=str)
+                                  "Run this with 'list' to view available Microphones.", type=str)
     args = parser.parse_args()
 
     # The last time a recording was retrieved from the queue.
@@ -59,16 +61,11 @@ def main():
     else:
         source = sr.Microphone(sample_rate=16000)
 
-    # Load / Download model
-    model = args.model
-    if args.model != "large" and not args.non_english:
-        model = model + ".en"
-    audio_model = whisper.load_model(model)
-
+    #optimizing transcription time using faster-whisper
+    audio_model = WhisperModel(args.model, device = 'cuda')
+    
     record_timeout = args.record_timeout
     phrase_timeout = args.phrase_timeout
-
-    transcription = ['']
 
     with source:
         recorder.adjust_for_ambient_noise(source)
@@ -88,7 +85,13 @@ def main():
 
     # Cue the user that we're ready to go.
     print("Model loaded.\n")
+    def process_audio_chunk(audio_np):
+        result = audio_model.transcribe(audio_np, language="en", beam_size=5, best_of=5, temperature=0.4)[0]
+        return "".join(segment.text for segment in result)
+        
 
+    i = 0
+    transcription = []
     while True:
         try:
             now = datetime.utcnow()
@@ -99,6 +102,7 @@ def main():
                 # Clear the current working audio buffer to start over with the new data.
                 if phrase_time and now - phrase_time > timedelta(seconds=phrase_timeout):
                     phrase_complete = True
+                    
                 # This is the last time we received new audio data from the queue.
                 phrase_time = now
                 
@@ -106,31 +110,21 @@ def main():
                 audio_data = b''.join(data_queue.queue)
                 data_queue.queue.clear()
                 
-                # Convert in-ram buffer to something the model can use directly without needing a temp file.
-                # Convert data from 16 bit wide integers to floating point with a width of 32 bits.
-                # Clamp the audio stream frequency to a PCM wavelength compatible default of 32768hz max.
+                # Necessary conversion
                 audio_np = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
 
-                # Read the transcription.
-                result = audio_model.transcribe(audio_np, fp16=torch.cuda.is_available())
-                text = result['text'].strip()
+                partial_text = process_audio_chunk(audio_np)
+                transcription.append(partial_text)
 
-                # If we detected a pause between recordings, add a new item to our transcription.
-                # Otherwise edit the existing one.
-                if phrase_complete:
-                    transcription.append(text)
-                else:
-                    transcription[-1] = text
+                if i == 0:
+                    print("TRANSCRIPTION HAS STARTED")
+                    print("-------------------------")
+                    print('\n')
+                print(transcription[i])
+                i = i+1
 
-                # Clear the console to reprint the updated transcription.
-                os.system('cls' if os.name=='nt' else 'clear')
-                for line in transcription:
-                    print(line)
-                # Flush stdout.
-                print('', end='', flush=True)
             else:
-                # Infinite loops are bad for processors, must sleep.
-                sleep(0.25)
+                sleep(0.05)
         except KeyboardInterrupt:
             break
 
